@@ -1,0 +1,4 @@
+﻿  DllMain.cpp
+c:\users\david\desktop\programacion\c++\hackpwnadventure3\hackpwnadventure3\dllmain.cpp(144): warning C4244: 'argumento': conversión de 'UINT64' a 'unsigned int'; posible pérdida de datos
+c:\users\david\desktop\programacion\c++\hackpwnadventure3\hackpwnadventure3\dllmain.cpp(222): warning C4244: 'inicializando': conversión de 'double' a 'UINT64'; posible pérdida de datos
+  HackPwnAdventure3.vcxproj -> C:\Users\david\Desktop\programacion\c++\HackPwnAdventure3\Debug\HackPwnAdventure3.dll
