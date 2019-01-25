@@ -6,7 +6,10 @@ acceder a sus datos mediante esa direccion. Probar a hacerlo con un vector3?
 
 asegurar que el tamaño del name en el log no supere 20 IMPORTANT
 
+*******IMPORTANT*********
 PENSAR HACER LA VARIABLE PLAYER GLOBAL, DE MANERA QUE SEA CONST. HAY ALGUNA MANERA?
+HACER QUE PLAYER TICK COMPRUEBA SI LA GLOBAL ES NULLPTR, EN ESE CASO PONER pPlayer Y realpPplayer
+Y ASI QUITAR TODOS LOS ARGS
 
 QUE TE DIGA QUE NO HA ENCONTRADO FUNCIONES EN ESE CASO.
 
@@ -14,7 +17,6 @@ QUE EL BRUTEFORCE PARE CUANDO ENCUENTRE ALGO
 
 THREADS NO VAN BIEN POR LA DIVISION ENTERA
 
-MAYBE I SHOULD INCLUDE ALL THOSE CHANGES TO GameLogic.dll 
 */
 #include <iostream>
 #include <Windows.h>
@@ -23,7 +25,6 @@ MAYBE I SHOULD INCLUDE ALL THOSE CHANGES TO GameLogic.dll
 #include <sstream>
 #include <thread>
 #include <map>
-
 #include "detours.h"
 #include "sigscan.h"
 
@@ -34,8 +35,18 @@ using namespace std;
 FILE* pCout;
 FILE* pCin;
 
+const int addrsToNope = 2;
+DWORD addrToNopeFastTravels[addrsToNope];
+const BYTE codeToNopeFastTravels[addrsToNope][2] = { { '\x75', '\x75' }, {'\x74', '\x66'} };
+
+float playerSpeed = 200.0;
+float playerJump = 420.0;
+bool playerCanJumpActivated = false;
+bool fastTravelsActivated = false;
+
 map<string, string> help = {
-	{"Help", "Available commands: tp, tpr, input, output, bruteforce. Write help <command> to know more."},
+	{"Help", "Available commands: set, tp, tpr, input, output, bruteforce. Write help <command> to know more."},
+	{"set", "Sets a value to a variable. Syntax: set <variable> <value>. Available variables and values are listed below.\nSpeed: player walking speed. Double.\nJump: player jump height. Double.\nCanjump: enables or disables flying hack. Bool.\nFasttravels: enables or disables having all fast travels discovered. Bool."},
 	{"tp", "Teleports you to given coords. Syntax: tp <x> <y> <z>"},
 	{"tpr", "Teleports you to given coords relatively to your current position. Syntax: tpr <x> <y> <z>"},
 	{"input", "Sets the given value as input of the given stage of Blocky Challenge. The stage must be given as a number from 1 to 5. Syntax: input <stage> <value>"},
@@ -44,12 +55,18 @@ map<string, string> help = {
 };
 
 //Definition of pointer to function types
+typedef void (__thiscall *pPlayerTick_t)(void *real_pPlayer, float delta_time);
 typedef void (__thiscall *pPlayerChat_t)(void *_pPlayer, const char *text);
 typedef void (__thiscall *pActorSetPosition_t)(void *_pActor, DWORD pVector3);
 typedef void (__thiscall *pPlayerReceiveChat_t)(void *real_pPlayer, DWORD pSource, const char *text);
 typedef void (__thiscall *pActorGetPosition_t)(void *_pActor, float *result);
 typedef void (__thiscall *pPlayerSetCircuitInputs_t)(void *_pPlayer, const char *name, unsigned int state);
 typedef void (__thiscall *pPlayerGetCircuitOutputs_t)(void *_pPlayer, const char *name, bool states[], unsigned int len);
+typedef bool (__thiscall *pPlayerCanJump_t)(void *_pPlayer);
+
+
+//Player.Tick seems to be called every frame. I hook it to change constantly speed and jump height.
+pPlayerTick_t OriginalPlayerTick;
 
 //Player.Chat is called when the player sends a message. This function is hooked so I can
 //read input from the player and perform actions according to that.
@@ -75,6 +92,10 @@ pPlayerSetCircuitInputs_t PlayerSetCircuitInputs;
 //Player.GetCircuitInputs returns the state of the circuit of a stage. I use this for the
 //bruteforce, so I can check if a combination is valid or not.
 pPlayerGetCircuitOutputs_t PlayerGetCircuitOutputs;
+
+//Player.CanJump returns true or false depending on whether the player should be allowed to jump
+//or not. I detour it so I can return always true or just call the original function.
+pPlayerCanJump_t OriginalPlayerCanJump;
 
 //Returns the given string splitted according to the delimiter #copied
 vector<string> split(const string& s, char delimiter)
@@ -151,6 +172,11 @@ void log_ingame(void* real_pPlayer, string name_str, string text_str){
 	VirtualProtect(addr_a_cambiar, 1, oldprot, &useless);
 }
 
+//Logs ingame the help of a given command
+void display_help(void *real_pPlayer, string command_name){
+	log_ingame(real_pPlayer, "Help [" + command_name + "]", help[command_name]);
+}
+
 //Teleports the player to the pos
 void tp(float pos[3], void *real_pPlayer) {
 	//seems like pos is something like a array of 6 floats: {x, y, z, diffx, diffy, diffz},
@@ -179,6 +205,21 @@ void bruteforce(UINT64 first, UINT64 last, const char *stage, void *_pPlayer) {
 	}
 }
 
+void disenable_fast_travels(bool enable){
+	DWORD oldprot, useless;
+	for (int i = 0; i < addrsToNope; i++){
+		VirtualProtect((void*)addrToNopeFastTravels[i], 2, PAGE_EXECUTE_READWRITE, &oldprot);
+		if (enable){
+			*(BYTE*)(addrToNopeFastTravels[i]) = '\x90';
+			*(BYTE*)(addrToNopeFastTravels[i] + 1) = '\x90';
+		} else {
+			*(BYTE*)(addrToNopeFastTravels[i]) = codeToNopeFastTravels[i][0];
+			*(BYTE*)(addrToNopeFastTravels[i] + 1) = codeToNopeFastTravels[i][1];
+		}
+		VirtualProtect((void*)addrToNopeFastTravels[i], 2, oldprot, &useless);
+	}
+}
+
 //Handles the tp command, performing relative or absolute teleport and logging
 void tp_command(vector<string> splitted_text, bool relative, void *real_pPlayer){
 	if (splitted_text.size() == 4) {
@@ -193,7 +234,8 @@ void tp_command(vector<string> splitted_text, bool relative, void *real_pPlayer)
 		log_ingame(real_pPlayer, "Command", "Teleporting to position " + to_string_precision(pos[0], 0) + ", " + to_string_precision(pos[1], 0) + ", " + to_string_precision(pos[2], 0) + ".");
 		tp(pos, real_pPlayer);
 	} else {
-		log_ingame(real_pPlayer, "Command", "Wrong tp command??");
+		//log_ingame(real_pPlayer, "Command", "Wrong tp command??");
+		display_help(real_pPlayer, splitted_text[0]);
 	}
 }
 
@@ -210,7 +252,7 @@ void input_command(vector<string> splitted_text, void *_pPlayer){
 		cout << "input " << splitted_text[2] << " set to " << stage << endl;
 		log_ingame(real_pPlayer, "Command", "Input " + splitted_text[2] + " set to " + stage);
 	} else {
-		log_ingame(real_pPlayer, "Command", "Wrong input command??");
+		display_help(real_pPlayer, splitted_text[0]);
 	}
 }
 
@@ -227,7 +269,7 @@ void output_command(vector<string> splitted_text, void *_pPlayer){
 		cout << "state of " << stage << ": " << states[0] << endl;
 		log_ingame(real_pPlayer, "Command", "Output of " + string(stage) + " is " + (states[0] ? "1" : "0"));
 	} else {
-		log_ingame(real_pPlayer, "Command", "Wrong output command??");
+		display_help(real_pPlayer, splitted_text[0]);
 	}
 }
 
@@ -276,21 +318,53 @@ void bruteforce_command(vector<string> splitted_text, void *_pPlayer){
 		*(BYTE*)(addr + 1) = original;
 		VirtualProtect((void*)addr, 2, oldprot, &useless);
 	} else {
-		log_ingame(real_pPlayer, "Command", "Wrong bruteforce command?");
+		display_help(real_pPlayer, splitted_text[0]);
+	}
+}
+
+//Handles the set command, modifying player speed, jump height, ..., and logging
+void set_command(vector<string> splitted_text, void *real_pPlayer){
+	if (splitted_text.size() == 3){
+		if (splitted_text[1] == "speed"){
+			playerSpeed = stof(splitted_text[2]);
+			log_ingame(real_pPlayer, "Command", "Set player speed to " + splitted_text[2]);
+		} else if (splitted_text[1] == "jump"){
+			playerJump = stof(splitted_text[2]);
+			log_ingame(real_pPlayer, "Command", "Set player jump height to " + splitted_text[2]);
+		} else if (splitted_text[1] == "canjump"){
+			if (splitted_text[2] == "1" || splitted_text[2] == "true"){
+				playerCanJumpActivated = true;
+				log_ingame(real_pPlayer, "Command", "Enabled jump hack.");
+			} else if (splitted_text[2] == "0" || splitted_text[2] == "false"){
+				playerCanJumpActivated = false;
+				log_ingame(real_pPlayer, "Command", "Disabled jump hack.");
+			}
+		} else if (splitted_text[1] == "fasttravels"){
+			if (splitted_text[2] == "1" || splitted_text[2] == "true") {
+				disenable_fast_travels(true);
+				log_ingame(real_pPlayer, "Command", "Enabled all fast travels.");
+			}
+			else if (splitted_text[2] == "0" || splitted_text[2] == "false") {
+				disenable_fast_travels(false);
+				log_ingame(real_pPlayer, "Command", "Disabled all fast travels.");
+			}
+		}
+	} else {
+		display_help(real_pPlayer, splitted_text[0]);
 	}
 }
 
 //Handles the help command, logging the help
 void help_command(vector <string> splitted_text, void *real_pPlayer){
-	if (splitted_text.size() < 2){
-		log_ingame(real_pPlayer, "Help", help["Help"]);
-	} else {
+	if (splitted_text.size() == 2){
 		const char * command = splitted_text[1].c_str();
-		if (help.count(command) == 0){
-			log_ingame(real_pPlayer, "Help", "Help for command " + splitted_text[1] + " not found!");
+		if (help.count(command) != 0) {
+			display_help(real_pPlayer, splitted_text[1]);
 		} else {
-			log_ingame(real_pPlayer, "Help [" + splitted_text[1] + "]", help[command]);
+			log_ingame(real_pPlayer, "Help", "Help for command " + splitted_text[1] + " not found!");
 		}
+	} else {
+		display_help(real_pPlayer, "Help");
 	}
 }
 
@@ -309,12 +383,24 @@ void command(string text, void* real_pPlayer){
 			output_command(splitted_text, _pPlayer);
 		} else if (splitted_text[0] == "bruteforce") {
 			bruteforce_command(splitted_text, _pPlayer);
+		} else if (splitted_text[0] == "set") {
+			set_command(splitted_text, real_pPlayer);
 		} else if (splitted_text[0] == "help") {
 			help_command(splitted_text, real_pPlayer);
 		} else {
 			log_ingame(real_pPlayer, "Command", "Unknown command.");
 		}
 	}
+}
+
+//Hook of Player.Tick. Changes player speed and jump height
+void __fastcall HookPlayerTick(void *real_pPlayer, int edx, float delta_time){
+	float *pPlayerSpeed = (float*)((DWORD)real_pPlayer + 0x190);
+	float *pPlayerJump = (float*)((DWORD)real_pPlayer + 0x194);
+	*pPlayerSpeed = playerSpeed;
+	*pPlayerJump = playerJump;
+	//parece que funciona pero la vez anterior no
+	OriginalPlayerTick(real_pPlayer, delta_time);
 }
 
 //Hook of Player.Chat. Calls the function command with the received text
@@ -341,6 +427,16 @@ void __fastcall HookActorSetPosition(void *_pActor, int edx, DWORD pVector3){
 	OriginalActorSetPosition(_pActor, pVector3);
 }
 
+//Hook of Player.CanJump. Returns true or calls the original function
+bool __fastcall HookPlayerCanJump(void *_pPlayer){
+	bool ret;
+	if (playerCanJumpActivated){
+		ret = true;
+	} else {
+		ret = OriginalPlayerCanJump(_pPlayer);
+	}
+	return ret;
+}
 
 BOOL WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved){
 	if (dwReason == DLL_PROCESS_ATTACH || dwReason == DLL_PROCESS_DETACH){
@@ -352,39 +448,55 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved){
 
 			//Looks for every function
 			SigScan scanner;
+			DWORD addrPlayerTick = scanner.FindPattern("GameLogic.dll", "\x55\x8B\xEC\x83\xE4\xC0", "xxxxxx");
 			DWORD addrPlayerChat = scanner.FindPattern("GameLogic.dll", "\x55\x8B\xEC\x83\xE4\xF8\x6A\xFF\x68\x00\x00\x00\x00\x64\xA1\x00\x00\x00\x00\x50\x83\xEC\x24\xA1\x00\x00\x00\x00\x33\xC4\x89\x44\x24\x1C\x56\x57\xA1\x00\x00\x00\x00\x33\xC4\x50\x8D\x44\x24\x30\x64\xA3\x00\x00\x00\x00\x8B\xF9\x8B\x55\x08\xC7\x44\x24\x00\x00\x00\x00\x00\xC7\x44\x24\x00\x00\x00\x00\x00\xC6\x44\x24\x10\x00\x80\x3A\x00\x75\x04\x33\xC9", "xxxxxxxxx????xx????xxxxx????xxxxxxxxx????xxxxxxxxx????xxxxxxxx?????xxx?????xxxxxxxxxxxx", 3);
 			DWORD addrActorSetPosition = scanner.FindPattern("GameLogic.dll", "\x55\x8B\xEC\x8B\x55\x08\xF3\x0F\x7E\x02\x66\x0F\xD6\x41", "xxxxxxxxxxxxxx");
 			DWORD addrPlayerReceiveChat = scanner.FindPattern("GameLogic.dll", "\x55\x8B\xEC\x83\xE4\xF8\x6A\xFF\x68\x00\x00\x00\x00\x64\xA1\x00\x00\x00\x00\x50\x83\xEC\x40\xA1\x00\x00\x00\x00\x33\xC4\x89\x44\x24\x38\x53\x56\x57\xA1\x00\x00\x00\x00\x33\xC4\x50\x8D\x44\x24\x50\x64\xA3\x00\x00\x00\x00\x8B\xC1", "xxxxxxxxx????xx????xxxxx????xxxxxxxxxx????xxxxxxxxx????xx");
 			DWORD addrActorGetPosition = scanner.FindPattern("GameLogic.dll", "\x55\x8B\xEC\x8B\x49\x0C\x85\xC9\x75\x0F\x8B\x45\x08\x89\x08\x89\x48\x04\x89\x48\x08\x5D\xC2\x04\x00\x8B\x11\xFF\x75\x08\xFF\x52\x08", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
 			DWORD addrPlayerSetCircuitInputs = scanner.FindPattern("GameLogic.dll", "\x55\x8B\xEC\x83\xE4\xF8\x6A\xFF\x68\x00\x00\x00\x00\x64\xA1\x00\x00\x00\x00\x50\x83\xEC\x24\xA1\x00\x00\x00\x00\x33\xC4\x89\x44\x24\x1C\x56\x57\xA1\x00\x00\x00\x00\x33\xC4\x50\x8D\x44\x24\x30\x64\xA3\x00\x00\x00\x00\x8B\xF9\x8B\x0D", "xxxxxxxxx????xx????xxxxx????xxxxxxxxx????xxxxxxxxx????xxxx");
 			DWORD addrPlayerGetCircuitOutputs = scanner.FindPattern("GameLogic.dll", "\x55\x8B\xEC\x83\xE4\xF8\x83\xEC\x24\xA1\x00\x00\x00\x00\x33\xC4\x89\x44\x24\x20\x8B\x45\x0C\x53\x8B\x5D\x10", "xxxxxxxxxx????xxxxxxxxxxxxx");
-			cout << "PlayerChat found at " << addrPlayerChat << endl;
-			cout << "ActorSetPosition found at " << addrActorSetPosition << endl;
-			cout << "PlayerReceive chat found at " << addrPlayerReceiveChat << endl;
-			cout << "ActorGetPosition found at " << addrActorGetPosition << endl;
-			cout << "PlayerSetCircuitInputs found at " << addrPlayerSetCircuitInputs << endl;
-			cout << "PlayerGetCircuitOutputs found at " << addrPlayerGetCircuitOutputs << endl;
-
+			DWORD addrPlayerCanJump = scanner.FindPattern("GameLogic.dll", "\x8B\x49\x9C\x85\xC9", "xxxxx");
+			DWORD addrToNopeFastTravelsFirst = scanner.FindPattern("GameLogic.dll", "\x75\x75\x8B\x03\x8B\xCB", "xxxxxx");
+			cout << "PlayerTick address: " << addrPlayerTick << endl;
+			cout << "PlayerChat address: " << addrPlayerChat << endl;
+			cout << "ActorSetPosition address: " << addrActorSetPosition << endl;
+			cout << "PlayerReceive chat address: " << addrPlayerReceiveChat << endl;
+			cout << "ActorGetPosition address: " << addrActorGetPosition << endl;
+			cout << "PlayerSetCircuitInputs address: " << addrPlayerSetCircuitInputs << endl;
+			cout << "PlayerGetCircuitOutputs address: " << addrPlayerGetCircuitOutputs << endl;
+			cout << "PlayerCanJump address: " << addrPlayerCanJump << endl;
+			cout << "Nope fast travels found at: " << addrToNopeFastTravelsFirst << endl;
+			
 			//Performs detours
 			DetourTransactionBegin();
 			DetourUpdateThread(GetCurrentThread());
+			DetourAttach(&(PVOID&)addrPlayerTick, HookPlayerTick);
 			DetourAttach(&(PVOID&)addrPlayerChat, HookPlayerChat);
 			DetourAttach(&(PVOID&)addrActorSetPosition, HookActorSetPosition);
+			DetourAttach(&(PVOID&)addrPlayerCanJump, HookPlayerCanJump);
 			DetourTransactionCommit();
 
 			cout << "\nDetours commited. New original addressed:" << endl;
+			cout << "PlayerTick: " << addrPlayerTick << endl;
 			cout << "PlayerChat: " << addrPlayerChat << endl;
 			cout << "ActorSetPosition: " << addrActorSetPosition << endl;
+			cout << "PlayerCanJump: " << addrPlayerCanJump << endl;
 			cout << endl;
 
 			//Save the functions
+			OriginalPlayerTick = (pPlayerTick_t)addrPlayerTick;
 			OriginalPlayerChat = (pPlayerChat_t)addrPlayerChat;
 			OriginalActorSetPosition = (pActorSetPosition_t)addrActorSetPosition;
 			PlayerReceiveChat = (pPlayerReceiveChat_t)addrPlayerReceiveChat;
 			ActorGetPosition = (pActorGetPosition_t)addrActorGetPosition;
 			PlayerSetCircuitInputs = (pPlayerSetCircuitInputs_t)addrPlayerSetCircuitInputs;
 			PlayerGetCircuitOutputs = (pPlayerGetCircuitOutputs_t)addrPlayerGetCircuitOutputs;
+			OriginalPlayerCanJump = (pPlayerCanJump_t)addrPlayerCanJump;
 			
+			addrToNopeFastTravels[0] = addrToNopeFastTravelsFirst;
+			addrToNopeFastTravels[1] = addrToNopeFastTravelsFirst + 0x0F;
+
+
 			cout << dec;
 
 		} else if (dwReason == DLL_PROCESS_DETACH){
